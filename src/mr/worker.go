@@ -1,13 +1,13 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
-	"sort"
 )
 
 // Map functions return a slice of KeyValue.
@@ -15,6 +15,12 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -29,36 +35,88 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-	args := AssignTaskArgs{}
-	reply := AssignTaskReply{}
-	ok := call("Coordinator.AssignTask", &args, &reply)
-	if ok {
-		fmt.Printf("reply: ID=%d, Type=%s\n", reply.WorkerID, reply.TaskType)
-	} else {
-		fmt.Println("call failed!")
-	}
-	// After getting the reply, call mapf/reducef.
-	if reply.TaskType == "map" {
-		// map
-		intermediate := []KeyValue{}
-		file, err := os.Open(reply.Filename)
-		if err != nil {
-			log.Fatalf("cannot open %v", reply.Filename)
+	for {
+		args := AssignTaskArgs{}
+		reply := AssignTaskReply{}
+		ok := call("Coordinator.AssignTask", &args, &reply)
+		if ok {
+			fmt.Printf("reply: ID=%d, Type=%s\n", reply.WorkerID, reply.TaskType)
+		} else {
+			fmt.Println("call failed!")
 		}
-		content, err := ioutil.ReadAll(file)
-		if err != nil {
-			log.Fatalf("cannot read %v", reply.Filename)
+		// After getting the reply, call mapf/reducef.
+		switch reply.TaskType {
+		case "map":
+			file, err := os.Open(reply.Filename)
+			if err != nil {
+				log.Fatalf("cannot open %v", reply.Filename)
+			}
+			content, err := ioutil.ReadAll(file)
+			if err != nil {
+				log.Fatalf("cannot read %v", reply.Filename)
+			}
+			file.Close()
+			kva := mapf(reply.Filename, string(content))
+
+			buckets := make([][]KeyValue, reply.NReduce)
+			for _, kv := range kva {
+				r := ihash(kv.Key) % reply.NReduce
+				buckets[r] = append(buckets[r], kv)
+			}
+			for r := 0; r < reply.NReduce; r++ {
+				oname := fmt.Sprintf("mr-%d-%d", reply.WorkerID, r)
+				ofile, _ := os.Create(oname)
+				enc := json.NewEncoder(ofile)
+				for _, kv := range buckets[r] {
+					_ = enc.Encode(&kv)
+				}
+				ofile.Close()
+			}
+
+		case "reduce":
+			ifiles := []string{}
+			kva := []KeyValue{}
+			for m := 0; m < reply.NMap; m++ {
+				ifile := fmt.Sprintf("mr-%d-%d", m, reply.WorkerID)
+				ifiles = append(ifiles, ifile)
+			}
+			for _, ifile := range ifiles {
+				file, err := os.Open(ifile)
+				if err != nil {
+					log.Fatalf("cannot open %v", ifile)
+				}
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					kva = append(kva, kv)
+				}
+				file.Close()
+			}
+			i := 0
+			for i < len(kva) {
+				j := i + 1
+				for j < len(kva) && kva[j].Key == kva[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, kva[k].Value)
+				}
+				output := reducef(kva[i].Key, values)
+
+				oname := fmt.Sprintf("mr-out-%d", reply.WorkerID)
+				ofile, _ := os.OpenFile(oname, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+				fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+				ofile.Close()
+
+				i = j
+			}
+		default:
+			// unknown task type
 		}
-		file.Close()
-		kva := mapf(reply.Filename, string(content))
-		intermediate = append(intermediate, kva...)
-
-		sort.Sort(ByKey(intermediate))
-
-		oname := "mr-out-0"
-		ofile, _ := os.Create(oname)
-	} else {
-		// reduce
 	}
 
 	// uncomment to send the Example RPC to the coordinator.

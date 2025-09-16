@@ -45,7 +45,7 @@ func (c *Coordinator) AssignTask(args *AssignTaskArgs, reply *AssignTaskReply) e
 				reply.NReduce = c.nReduce
 				reply.NMap = c.nMap
 				c.tasks[i].Status = InProgress
-				break
+				return nil
 			}
 		}
 	} else {
@@ -57,10 +57,11 @@ func (c *Coordinator) AssignTask(args *AssignTaskArgs, reply *AssignTaskReply) e
 				reply.NReduce = c.nReduce
 				reply.NMap = c.nMap
 				c.tasks[i].Status = InProgress
-				break
+				return nil
 			}
 		}
 	}
+	reply.TaskType = "wait"
 
 	return nil
 }
@@ -90,11 +91,32 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
-
 	// Your code here.
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	return ret
+	for _, task := range c.tasks {
+		if task.Status != Completed {
+			return false
+		}
+	}
+
+	if c.phase == "map" {
+		// transition to reduce phase
+		c.phase = "reduce"
+		c.tasks = make([]Task, c.nReduce)
+		for i := 0; i < c.nReduce; i++ {
+			c.tasks[i] = Task{
+				TaskType: "reduce",
+				TaskID:   i,
+				Filename: "",
+				Status:   Idle,
+			}
+		}
+		return false
+	}
+
+	return true
 }
 
 // create a Coordinator.
@@ -104,6 +126,18 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
+	c.phase = "map"
+	c.nMap = len(files)
+	c.nReduce = nReduce
+	c.tasks = make([]Task, c.nMap)
+	for i, filename := range files {
+		c.tasks[i] = Task{
+			TaskType: "map",
+			TaskID:   i,
+			Filename: filename,
+			Status:   Idle,
+		}
+	}
 
 	c.server()
 	return &c
