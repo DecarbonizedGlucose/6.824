@@ -28,12 +28,19 @@ type ExampleReply struct {
 type AssignTaskArgs struct{}
 
 type AssignTaskReply struct {
-	WorkerID int
+	TaskID   int
 	TaskType string
 	Filename string
 	NReduce  int
 	NMap     int
 }
+
+type CompletedTaskArgs struct {
+	TaskID   int
+	TaskType string
+}
+
+type CompletedTaskReply struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -40,7 +42,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		reply := AssignTaskReply{}
 		ok := call("Coordinator.AssignTask", &args, &reply)
 		if ok {
-			fmt.Printf("reply: ID=%d, Type=%s\n", reply.WorkerID, reply.TaskType)
+			fmt.Printf("reply: ID=%d, Type=%s\n", reply.TaskID, reply.TaskType)
 		} else {
 			fmt.Println("call failed!")
 		}
@@ -64,7 +66,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				buckets[r] = append(buckets[r], kv)
 			}
 			for r := 0; r < reply.NReduce; r++ {
-				oname := fmt.Sprintf("mr-%d-%d", reply.WorkerID, r)
+				oname := fmt.Sprintf("mr-%d-%d", reply.TaskID, r)
 				ofile, _ := os.Create(oname)
 				enc := json.NewEncoder(ofile)
 				for _, kv := range buckets[r] {
@@ -72,12 +74,11 @@ func Worker(mapf func(string, string) []KeyValue,
 				}
 				ofile.Close()
 			}
-
 		case "reduce":
 			ifiles := []string{}
 			kva := []KeyValue{}
 			for m := 0; m < reply.NMap; m++ {
-				ifile := fmt.Sprintf("mr-%d-%d", m, reply.WorkerID)
+				ifile := fmt.Sprintf("mr-%d-%d", m, reply.TaskID)
 				ifiles = append(ifiles, ifile)
 			}
 			for _, ifile := range ifiles {
@@ -95,6 +96,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				}
 				file.Close()
 			}
+			sort.Sort(ByKey(kva))
 			i := 0
 			for i < len(kva) {
 				j := i + 1
@@ -107,15 +109,29 @@ func Worker(mapf func(string, string) []KeyValue,
 				}
 				output := reducef(kva[i].Key, values)
 
-				oname := fmt.Sprintf("mr-out-%d", reply.WorkerID)
+				oname := fmt.Sprintf("mr-out-%d", reply.TaskID)
 				ofile, _ := os.OpenFile(oname, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 				fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
 				ofile.Close()
 
 				i = j
 			}
-		default:
-			// unknown task type
+		case "wait":
+			time.Sleep(500 * time.Millisecond)
+			continue
+		default: // "none", job done
+			return
+		}
+		a2 := CompletedTaskArgs{
+			TaskID:   reply.TaskID,
+			TaskType: reply.TaskType,
+		}
+		r2 := CompletedTaskReply{}
+		ok2 := call("Coordinator.CompletedTask", &a2, &r2)
+		if ok2 {
+			fmt.Printf("CompletedTask: ID=%d, Type=%s\n", a2.TaskID, a2.TaskType)
+		} else {
+			fmt.Println("call failed!")
 		}
 	}
 

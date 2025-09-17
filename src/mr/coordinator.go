@@ -26,7 +26,7 @@ type Coordinator struct {
 	// Your definitions here.
 	mu      sync.Mutex
 	tasks   []Task
-	phase   string
+	phase   string // "map" -> "reduce" -> "done"
 	nMap    int
 	nReduce int
 }
@@ -39,7 +39,19 @@ func (c *Coordinator) AssignTask(args *AssignTaskArgs, reply *AssignTaskReply) e
 	if c.phase == "map" {
 		for i, task := range c.tasks {
 			if task.Status == Idle {
-				reply.WorkerID = i
+				reply.TaskID = i
+				reply.TaskType = task.TaskType
+				reply.Filename = task.Filename
+				reply.NReduce = c.nReduce
+				reply.NMap = c.nMap
+				c.tasks[i].Status = InProgress
+				return nil
+			}
+		}
+	} else if c.phase == "reduce" {
+		for i, task := range c.tasks {
+			if task.Status == Idle {
+				reply.TaskID = i
 				reply.TaskType = task.TaskType
 				reply.Filename = task.Filename
 				reply.NReduce = c.nReduce
@@ -49,19 +61,24 @@ func (c *Coordinator) AssignTask(args *AssignTaskArgs, reply *AssignTaskReply) e
 			}
 		}
 	} else {
-		for i, task := range c.tasks {
-			if task.Status == Idle {
-				reply.WorkerID = i
-				reply.TaskType = task.TaskType
-				reply.Filename = task.Filename
-				reply.NReduce = c.nReduce
-				reply.NMap = c.nMap
-				c.tasks[i].Status = InProgress
-				return nil
-			}
-		}
+		// job done
+		reply.TaskID = -1
+		reply.TaskType = "none"
 	}
 	reply.TaskType = "wait"
+
+	return nil
+}
+
+func (c *Coordinator) CompletedTask(args *CompletedTaskArgs, reply *CompletedTaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if args.TaskType == "map" && c.phase == "map" {
+		c.tasks[args.TaskID].Status = Completed
+	} else if args.TaskType == "reduce" && c.phase == "reduce" {
+		c.tasks[args.TaskID].Status = Completed
+	}
 
 	return nil
 }
@@ -95,6 +112,10 @@ func (c *Coordinator) Done() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.phase == "done" {
+		return true
+	}
+
 	for _, task := range c.tasks {
 		if task.Status != Completed {
 			return false
@@ -114,9 +135,10 @@ func (c *Coordinator) Done() bool {
 			}
 		}
 		return false
+	} else {
+		c.phase = "done"
+		return true
 	}
-
-	return true
 }
 
 // create a Coordinator.
