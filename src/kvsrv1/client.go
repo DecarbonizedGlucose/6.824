@@ -1,19 +1,23 @@
 package kvsrv
 
 import (
+	"time"
+
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 	tester "6.5840/tester1"
 )
 
 type Clerk struct {
-	clnt   *tester.Clnt
-	server string
+	clnt               *tester.Clnt
+	server             string
+	ReceivedErrVersion bool
 }
 
 func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 	ck := &Clerk{clnt: clnt, server: server}
 	// You may add code here.
+	ck.ReceivedErrVersion = false
 	return ck
 }
 
@@ -59,12 +63,29 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
 	args := rpc.PutArgs{Key: key, Value: value, Version: version}
 	reply := rpc.PutReply{}
-	ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
-	if ok {
-		if reply.Err == rpc.ErrVersion && version != 0 {
-			return rpc.ErrMaybe
+	// ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
+	// if ok {
+	// 	return reply.Err
+	// }
+	ok := false
+	for !ok {
+		ok = ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
+		if ok {
+			if reply.Err == rpc.ErrVersion {
+				if ck.ReceivedErrVersion {
+					ck.ReceivedErrVersion = false
+					return rpc.ErrMaybe
+				} else {
+					ck.ReceivedErrVersion = true
+					return rpc.ErrVersion
+				}
+			} else {
+				return reply.Err
+			}
+		} else {
+			time.Sleep(100 * time.Millisecond)
 		}
-		return reply.Err
 	}
-	return rpc.ErrNoKey
+	//return rpc.ErrNoKey
+	return rpc.Err("114514")
 }
