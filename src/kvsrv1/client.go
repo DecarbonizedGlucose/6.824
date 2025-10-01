@@ -86,6 +86,5 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
-	//return rpc.ErrNoKey
-	return rpc.Err("114514")
+	return rpc.ErrNoKey
 }
