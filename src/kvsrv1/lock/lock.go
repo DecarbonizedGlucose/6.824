@@ -25,12 +25,12 @@ func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
 	lk := &Lock{ck: ck}
 	// You may add code here
 	lk.name = l
+	lk.id = kvtest.RandValue(8)
 	return lk
 }
 
 func (lk *Lock) Acquire() {
 	// Your code here
-	lk.id = kvtest.RandValue(8)
 	for {
 		old, v, err := lk.ck.Get(lk.name)
 		if err == rpc.ErrNoKey || (err == rpc.OK && old == "") {
