@@ -35,11 +35,14 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
 	args := rpc.GetArgs{Key: key}
 	reply := rpc.GetReply{}
-	ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
-	if ok {
-		return reply.Value, reply.Version, reply.Err
+	for {
+		ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
+		if ok {
+			return reply.Value, reply.Version, reply.Err
+		} else {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
-	return "", 0, rpc.ErrNoKey
 }
 
 // Put updates key with value only if the version in the
