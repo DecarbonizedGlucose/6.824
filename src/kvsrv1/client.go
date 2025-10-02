@@ -9,15 +9,13 @@ import (
 )
 
 type Clerk struct {
-	clnt               *tester.Clnt
-	server             string
-	ReceivedErrVersion bool
+	clnt   *tester.Clnt
+	server string
 }
 
 func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 	ck := &Clerk{clnt: clnt, server: server}
 	// You may add code here.
-	ck.ReceivedErrVersion = false
 	return ck
 }
 
@@ -35,13 +33,13 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
 	args := rpc.GetArgs{Key: key}
 	reply := rpc.GetReply{}
+	ok := false
 	for {
-		ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
+		ok = ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
 		if ok {
 			return reply.Value, reply.Version, reply.Err
-		} else {
-			time.Sleep(100 * time.Millisecond)
 		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -71,21 +69,16 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// 	return reply.Err
 	// }
 	ok := false
+	retry := false
 	for !ok {
 		ok = ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
 		if ok {
-			if reply.Err == rpc.ErrVersion {
-				if ck.ReceivedErrVersion {
-					ck.ReceivedErrVersion = false
-					return rpc.ErrMaybe
-				} else {
-					ck.ReceivedErrVersion = true
-					return rpc.ErrVersion
-				}
-			} else {
-				return reply.Err
+			if reply.Err == rpc.ErrVersion && retry {
+				return rpc.ErrMaybe
 			}
+			return reply.Err
 		} else {
+			retry = true
 			time.Sleep(100 * time.Millisecond)
 		}
 	}

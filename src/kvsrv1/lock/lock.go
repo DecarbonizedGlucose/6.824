@@ -31,21 +31,51 @@ func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
 
 func (lk *Lock) Acquire() {
 	// Your code here
+	// for {
+	// 	old, v, err := lk.ck.Get(lk.name)
+	// 	if err == rpc.ErrNoKey || (err == rpc.OK && old == "") {
+	// 		err = lk.ck.Put(lk.name, lk.id, v)
+	// 		if err == rpc.OK {
+	// 			return
+	// 		}
+	// 	}
+	// }
 	for {
-		old, v, err := lk.ck.Get(lk.name)
-		if err == rpc.ErrNoKey || (err == rpc.OK && old == "") {
-			err = lk.ck.Put(lk.name, lk.id, v)
-			if err == rpc.OK {
-				return
+		owner, v, err := lk.ck.Get(lk.name)
+		if err == rpc.ErrNoKey || (err == rpc.OK && owner == "") {
+			for {
+				err = lk.ck.Put(lk.name, lk.id, v)
+				if err == rpc.OK {
+					return
+				} else if err == rpc.ErrVersion {
+					break
+				}
 			}
+		} else if err == rpc.OK && owner == lk.id {
+			return
 		}
 	}
 }
 
 func (lk *Lock) Release() {
 	// Your code here
-	owner, v, err := lk.ck.Get(lk.name)
-	if err == rpc.OK && owner == lk.id {
-		_ = lk.ck.Put(lk.name, "", v)
+	// owner, v, err := lk.ck.Get(lk.name)
+	// if err == rpc.OK && owner == lk.id {
+	// 	_ = lk.ck.Put(lk.name, "", v)
+	// }
+	for {
+		owner, v, err := lk.ck.Get(lk.name)
+		if err == rpc.OK && owner == lk.id {
+			for {
+				err = lk.ck.Put(lk.name, "", v)
+				if err == rpc.OK {
+					return
+				} else if err == rpc.ErrVersion {
+					break
+				}
+			}
+		} else if err == rpc.OK && owner == "" {
+			return
+		}
 	}
 }
