@@ -18,10 +18,19 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
 )
+
+func init() {
+	labgob.Register(RequestVoteArgs{})
+	labgob.Register(RequestVoteReply{})
+	labgob.Register(AppendEntriesArgs{})
+	labgob.Register(AppendEntriesReply{})
+	labgob.Register(LogEntry{})
+}
 
 type LogEntry struct {
 	Command interface{}
@@ -167,6 +176,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.state = Follower
 		rf.votedFor = -1
 		rf.lastHeart = time.Now()
+		reply.Term = args.Term
+		reply.VoteGranted = true
 		rf.persist()
 	} else if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		// 检查日志（暂时忽略）
@@ -177,6 +188,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		rf.lastHeart = time.Now()
 		rf.persist()
+	} else {
+		// 相同任期但已投票给其他候选者，拒绝投票
+		reply.Term = rf.currentTerm
 	}
 }
 
@@ -211,9 +225,33 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-type AppendEntriesArgs struct{}
+type AppendEntriesArgs struct {
+	Term int
+}
 
-type AppendEntriesReply struct{}
+type AppendEntriesReply struct {
+	Term int
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args.Term < rf.currentTerm {
+		// 拒绝老资历
+		reply.Term = rf.currentTerm
+		return
+	} else if args.Term > rf.currentTerm {
+		// 更新任期
+		rf.currentTerm = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.lastHeart = time.Now()
+		reply.Term = args.Term
+	} else {
+		rf.lastHeart = time.Now()
+		reply.Term = rf.currentTerm
+	}
+	// 复制日志
+	// ...
+}
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
@@ -231,13 +269,26 @@ func (rf *Raft) initLeaderState() {
 	}
 }
 
-func (rf *Raft) broacastHeartbeat() {
+func (rf *Raft) broadcastEmptyHeartbeat() {
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 		go func(server int) {
-			rf.sendAppendEntries(server, &AppendEntriesArgs{}, &AppendEntriesReply{})
+			args := &AppendEntriesArgs{Term: rf.currentTerm}
+			reply := &AppendEntriesReply{}
+			rf.sendAppendEntries(server, args, reply)
+		}(i)
+	}
+}
+
+func (rf *Raft) broadcastHeartbeat() {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(server int) {
+			// rf.sendAppendEntries(server, args, reply)
 		}(i)
 	}
 }
@@ -250,6 +301,8 @@ func (rf *Raft) startElection() bool {
 	rf.mu.Unlock()
 
 	votes := 1
+	rf.votedFor = rf.me
+	rf.persist()
 	n := len(rf.peers)
 	ch := make(chan bool, n-1) // 带缓冲的通道，防止阻塞
 
@@ -364,9 +417,25 @@ func (rf *Raft) ticker() {
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		elapsed := time.Since(rf.lastHeart)
-		if rf.state != Leader && elapsed >= time.Duration(ms)*time.Millisecond {
-			// 超时, 开始选举
-			rf.startElection()
+		if rf.state == Leader {
+			// 是领导者，发送心跳
+			rf.broadcastEmptyHeartbeat()
+		} else if elapsed >= time.Duration(ms)*time.Millisecond {
+			// 不是leader 且心跳超时, 开始选举
+			ok := false
+			for !ok && rf.state != Leader && !rf.killed() {
+				ok = rf.startElection()
+				if !ok {
+					// 选举失败，等待一段时间再重试
+					ms := 50 + (rand.Int63() % 300)
+					time.Sleep(time.Duration(ms) * time.Millisecond)
+				} else {
+					// 成为领导者，发送心跳
+					rf.initLeaderState()
+					rf.broadcastEmptyHeartbeat()
+					// go == true, auto break
+				}
+			}
 		}
 	}
 }
