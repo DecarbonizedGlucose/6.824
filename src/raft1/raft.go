@@ -231,14 +231,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// 遇到新的任期，或者相同任期的心跳，退回至跟随者
 	if args.Term >= rf.currentTerm {
-		if args.Term > rf.currentTerm {
-			rf.votedFor = -1
-		}
 		if args.Term > rf.currentTerm || rf.state != Follower {
 			rf.state = Follower
 		}
-		rf.currentTerm = args.Term
-		rf.persist()
+		if args.Term > rf.currentTerm {
+			rf.votedFor = -1
+			rf.currentTerm = args.Term
+			rf.persist()
+		}
 		// log.Printf("[Server %d][Term %d] Updated to Term %d (and become Follower)\n", rf.me, rf.currentTerm, args.Term)
 	}
 	rf.lastHeart = time.Now()
@@ -372,6 +372,7 @@ func (rf *Raft) broadcastHeartbeat() {
 				rf.state = Follower
 				rf.votedFor = -1
 				rf.persist()
+				rf.lastHeart = time.Now()
 				atomic.StoreInt32(&stay_leader, 0)
 				return
 			}
@@ -550,7 +551,7 @@ func (rf *Raft) ticker() {
 		switch state {
 		case Leader:
 			rf.broadcastHeartbeat()
-			time.Sleep(120 * time.Millisecond)
+			time.Sleep(time.Duration(120+rand.Int63n(30)) * time.Millisecond)
 
 		default:
 			timeout := time.Duration(150+rand.Int63n(150)) * time.Millisecond
@@ -558,6 +559,7 @@ func (rf *Raft) ticker() {
 
 			rf.mu.Lock()
 			elapsed := time.Since(lastHeart)
+			// 选举超时
 			if elapsed >= timeout && rf.state != Leader {
 				rf.mu.Unlock()
 				rf.startElection()
