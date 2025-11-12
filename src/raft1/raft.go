@@ -542,41 +542,29 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-
-		// 您的代码在此处 (3A)
-		// 检查领导者选举是否应该开始.
-		// 暂停 50 到 350 毫秒之间的随机时间。
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
 		rf.mu.Lock()
-		elapsed := time.Since(rf.lastHeart)
 		state := rf.state
-		if state == Leader {
-			// 是领导者，重置心跳时间
-			rf.lastHeart = time.Now()
-			rf.mu.Unlock()
-			// 发送心跳
+		lastHeart := rf.lastHeart
+		rf.mu.Unlock()
+
+		switch state {
+		case Leader:
 			rf.broadcastHeartbeat()
-		} else if elapsed >= time.Duration(ms)*time.Millisecond {
-			rf.mu.Unlock()
-			// 不是leader 且心跳超时, 开始选举
-			ok := false
-			for !ok && rf.state != Leader && !rf.killed() {
-				ok = rf.startElection()
-				if !ok {
-					// 选举失败，等待一段时间再重试
-					ms := 50 + (rand.Int63() % 300)
-					time.Sleep(time.Duration(ms) * time.Millisecond)
-				} else {
-					// 成为领导者，清理状态并发送心跳
-					rf.initLeaderState()
-					rf.broadcastHeartbeat()
-					// go == true, auto break
-					// log.Printf("=== Server %d became Leader at Term %d ===", rf.me, rf.currentTerm)
-				}
+			time.Sleep(120 * time.Millisecond)
+
+		default:
+			timeout := time.Duration(150+rand.Int63n(150)) * time.Millisecond
+			time.Sleep(timeout / 10)
+
+			rf.mu.Lock()
+			elapsed := time.Since(lastHeart)
+			if elapsed >= timeout && rf.state != Leader {
+				rf.mu.Unlock()
+				rf.startElection()
+				// 不再长循环，下次ticker继续检查
+			} else {
+				rf.mu.Unlock()
 			}
-		} else {
-			rf.mu.Unlock()
 		}
 	}
 }
