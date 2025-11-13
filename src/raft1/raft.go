@@ -16,7 +16,9 @@ import (
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
+
 	//"log"
+	"bytes"
 )
 
 func init() {
@@ -50,9 +52,9 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	currentTerm int        // 当前任期
-	votedFor    int        // 投票给谁
-	log         []LogEntry // 日志条目
+	currentTerm int        // 当前任期(Persistent)
+	votedFor    int        // 投票给谁(Persistent)
+	log         []LogEntry // 日志条目(Persistent)
 	commitIndex int        // 已提交的最高日志条目索引
 	lastApplied int        // 已应用到状态机的最高日志条目索引
 
@@ -79,34 +81,37 @@ func (rf *Raft) GetState() (int, bool) {
 // 在实现快照之后，传递当前快照（如果尚无快照，则传递 nil）。
 func (rf *Raft) persist() {
 	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // 恢复之前持久化的状态。如果 data 为 nil 或长度小于 1，说明没有持久化状态，
 // 可以直接返回。这里应从 data 解码出之前保存的字段并恢复到 Raft 实例中。
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	// if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) == 0 {
 		return
 	}
 	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		// log.Printf("Error in readPersist\n")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // 返回 Raft 已持久化状态占用的字节数（可用于判断何时需要做快照）。
@@ -270,8 +275,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(args.Entries) != 0 {
 		rf.log = rf.log[:args.PrevLogIndex+1]    // 去除有矛盾的日志
 		rf.log = append(rf.log, args.Entries...) // 追加新日志
+		rf.persist()
 	}
-	rf.persist()
 	// 更新 commitIndex
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = max(rf.commitIndex, min(args.LeaderCommit, len(rf.log)-1))
@@ -285,7 +290,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 func (rf *Raft) initLeaderState() {
-	// 成为领导者
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.state = Leader
 	rf.votedFor = -1
 	for i := range rf.peers {
@@ -408,10 +414,10 @@ func (rf *Raft) startElection() bool {
 	rf.state = Candidate
 	term := rf.currentTerm
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.mu.Unlock()
 
 	votes := 1
-	rf.persist()
 	n := len(rf.peers)
 	ch := make(chan bool, n-1) // 带缓冲的通道，防止阻塞
 
@@ -453,9 +459,7 @@ func (rf *Raft) startElection() bool {
 			votes++
 			if votes > n/2 {
 				// 取得多数票，成为 leader
-				rf.mu.Lock()
 				rf.initLeaderState()
-				rf.mu.Unlock()
 				return true
 			}
 		}
@@ -488,9 +492,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.currentTerm
 	newLog := LogEntry{Command: command, Term: term}
 	rf.log = append(rf.log, newLog)
+	rf.persist()
 	rf.nextIndex[rf.me] = index + 1
 	rf.matchIndex[rf.me] = index
-	rf.persist()
 	// log.Printf("[Leader %d][Term %d] Start() command at index %d\n", rf.me, rf.currentTerm, index)
 	go rf.broadcastHeartbeat()
 	return index, term, isLeader
@@ -591,6 +595,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log[0] = LogEntry{Term: 0} // 占位，日志索引从1开始
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+
+	// 从持久化状态恢复
+	rf.readPersist(persister.ReadRaftState())
 
 	// state int
 	rf.state = Follower
