@@ -142,7 +142,6 @@ func (rf *Raft) getRelPos(absIndex int) int {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	reply.Term = rf.currentTerm
 	// 检查任期
@@ -169,19 +168,23 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
+	// 修剪日志
+	newLog := make([]LogEntry, 1)
+	newLog[0] = LogEntry{Term: rf.lastIncludeTerm}
+
+	// 查找新快照的最后一个索引在当前日志的相对位置
+	relPos := rf.getRelPos(args.LastIncludedIndex)
+	if relPos >= 0 && relPos < len(rf.log) {
+		// 快照包含了部分日志，保留快照之后的日志
+		if relPos+1 < len(rf.log) {
+			newLog = append(newLog, rf.log[relPos+1:]...)
+		}
+	}
+	rf.log = newLog
+
 	// 更新快照元信息
 	rf.lastIncludeIndex = args.LastIncludedIndex
 	rf.lastIncludeTerm = args.LastIncludedTerm
-
-	// 由于快照已经提交，可以修剪日志
-	newLog := make([]LogEntry, 1)
-	newLog[0] = LogEntry{Term: rf.lastIncludeTerm}
-	if args.LastIncludedIndex < rf.getAbsPos(1) {
-		// 快照并未包含所有日志
-		logPos := rf.getRelPos(args.LastIncludedIndex)
-		newLog = append(newLog, rf.log[logPos+1:]...)
-	}
-	rf.log = newLog
 
 	// 写入新的快照并持久化
 	rf.persister.Save(rf.getRaftStateBytes(), args.Data)
@@ -189,6 +192,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// 更新 commitIndex 和 lastApplied
 	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
 	rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
+	rf.mu.Unlock()
 
 	// 应用新快照到状态机
 	rf.applyCh <- raftapi.ApplyMsg{
@@ -383,7 +387,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		conflictTerm := rf.log[rf.getRelPos(args.PrevLogIndex)].Term
 		idx := args.PrevLogIndex
-		for idx >= 1 && rf.log[rf.getRelPos(idx-1)].Term == conflictTerm {
+		for rf.getRelPos(idx) >= 1 && rf.log[rf.getRelPos(idx-1)].Term == conflictTerm {
 			idx--
 		}
 		reply.ConflictTerm = conflictTerm
@@ -498,9 +502,10 @@ func (rf *Raft) sendAppendEntries(server int, stay_leader *int32) {
 		// 对方日志太短
 		rf.nextIndex[server] = reply.ConflictIndex
 	}
-	// 是不是退的太多了？
+	// 已经退到不能用日志追加的地步了
 	if rf.nextIndex[server] < rf.lastIncludeIndex {
-		rf.sendInstallSnapshot(server)
+		go rf.sendInstallSnapshot(server)
+		return
 	}
 }
 
