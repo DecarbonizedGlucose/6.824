@@ -107,6 +107,9 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.log = log
 		rf.lastIncludedIndex = lastIncludedIndex
 		rf.lastIncludedTerm = lastIncludedTerm
+
+		rf.commitIndex = rf.lastIncludedIndex
+		rf.lastApplied = rf.lastIncludedIndex
 	}
 }
 
@@ -172,14 +175,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// 修剪日志
 	newLog := make([]LogEntry, 1)
 	newLog[0] = LogEntry{Term: args.LastIncludedTerm}
-
-	// 查找新快照的最后一个索引在当前日志的相对位置
-	relPos := rf.getRelPos(args.LastIncludedIndex)
-	if relPos >= 0 && relPos < len(rf.log) {
-		// 快照包含了部分日志，保留快照之后的日志
-		if relPos+1 < len(rf.log) {
-			newLog = append(newLog, rf.log[relPos+1:]...)
-		}
+	// 如果快照并未包含所有日志，保留快照之后的日志
+	if args.LastIncludedIndex >= rf.lastIncludedIndex && rf.getRelPos(args.LastIncludedIndex) < len(rf.log) {
+		relPos := rf.getRelPos(args.LastIncludedIndex)
+		newLog = append(newLog, rf.log[relPos+1:]...)
 	}
 	rf.log = newLog
 
@@ -238,8 +237,8 @@ func (rf *Raft) sendInstallSnapshot(server int) {
 		return
 	}
 	// 更新 nextIndex 和 matchIndex
-	rf.nextIndex[server] = max(rf.lastIncludedIndex+1, rf.nextIndex[server])
-	rf.matchIndex[server] = max(rf.lastIncludedIndex, rf.matchIndex[server])
+	rf.nextIndex[server] = rf.lastIncludedIndex + 1
+	rf.matchIndex[server] = rf.lastIncludedIndex
 }
 
 // 服务表示它已经创建了包含直到并包括 index 的快照，这意味着服务
@@ -426,7 +425,7 @@ func (rf *Raft) sendAppendEntries(server int, stay_leader *int32) {
 	if rf.nextIndex[server] <= rf.lastIncludedIndex {
 		// 需要发送快照
 		rf.mu.Unlock()
-		go rf.sendInstallSnapshot(server)
+		rf.sendInstallSnapshot(server)
 		return
 	}
 	args := &AppendEntriesArgs{
@@ -437,7 +436,10 @@ func (rf *Raft) sendAppendEntries(server int, stay_leader *int32) {
 	args.PrevLogIndex = rf.nextIndex[server] - 1
 	args.PrevLogTerm = rf.log[rf.getRelPos(args.PrevLogIndex)].Term
 	nextIndex := min(rf.nextIndex[server], rf.getAbsPos(len(rf.log)))
-	entries := append([]LogEntry{}, rf.log[rf.getRelPos(nextIndex):]...)
+	entries := []LogEntry{}
+	if rf.getRelPos(nextIndex) < len(rf.log) {
+		entries = append(entries, rf.log[rf.getRelPos(nextIndex):]...)
+	}
 	rf.mu.Unlock()
 	args.Entries = entries
 	reply := &AppendEntriesReply{}
@@ -466,7 +468,7 @@ func (rf *Raft) sendAppendEntries(server int, stay_leader *int32) {
 				break
 			}
 			rel := rf.getRelPos(N)
-			if rf.log[rel].Term != rf.currentTerm {
+			if rel < 0 || rel >= len(rf.log) || rf.log[rel].Term != rf.currentTerm {
 				continue
 			} // 只考虑本任期内的
 			count := 1
@@ -479,7 +481,6 @@ func (rf *Raft) sendAppendEntries(server int, stay_leader *int32) {
 				}
 			}
 			if count > len(rf.peers)/2 {
-				// log.Printf("term %d: leader %d commitIndex advance to %d", rf.currentTerm, rf.me, N)
 				rf.commitIndex = N
 				break // 过半即可
 			}
@@ -603,7 +604,6 @@ func (rf *Raft) startElection() bool {
 			votes++
 			if votes > n/2 {
 				// 取得多数票，成为 leader
-				// log.Printf("term %d: server %d becomes leader, lastLogIndex=%d lastLogTerm=%d", term, rf.me, rf.getAbsPos(len(rf.log)-1), rf.log[len(rf.log)-1].Term)
 				rf.initLeaderState()
 				return true
 			}
@@ -658,6 +658,14 @@ func (rf *Raft) applier() {
 		if rf.commitIndex > rf.lastApplied {
 			// 有可用日志
 			start := rf.lastApplied + 1
+			// 保证安全访问
+			if start <= rf.lastIncludedIndex {
+				start = rf.lastIncludedIndex + 1
+			}
+			if rf.getRelPos(start) < 0 || rf.getRelPos(start) >= len(rf.log) {
+				rf.mu.Unlock()
+				continue
+			}
 			end := rf.commitIndex
 			entries := make([]LogEntry, end-start+1)
 			copy(entries, rf.log[rf.getRelPos(start):rf.getRelPos(end)+1])
