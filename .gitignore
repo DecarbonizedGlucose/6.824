@@ -1,5 +1,5 @@
 pkg/
 *-handin.tar.gz
 src/raft1/log
-src/raft1/clean_log
+src/raft1/test.sh
 .idea
