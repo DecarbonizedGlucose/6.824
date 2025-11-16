@@ -17,7 +17,6 @@ import (
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
 
-	//"log"
 	"bytes"
 )
 
@@ -42,23 +41,23 @@ const (
 
 // 一个实现单个 Raft 对等节点的 Go 对象。
 type Raft struct {
-	mu               sync.Mutex            // mutex锁
-	peers            []*labrpc.ClientEnd   // 所有对等节点的RPC端点
-	persister        *tester.Persister     // 持久化状态的对象
-	me               int                   // 本节点的在peers里的索引
-	dead             int32                 // 该节点是否已被杀死
-	currentTerm      int                   // 当前任期(Persistent)
-	votedFor         int                   // 投票给谁(Persistent)
-	log              []LogEntry            // 日志条目(Persistent)
-	commitIndex      int                   // 已提交的最高日志条目绝对索引
-	lastApplied      int                   // 已应用到状态机的最高日志条目绝对索引
-	state            int                   // 节点状态：候选者、领导者、跟随者
-	lastHeart        time.Time             // 最后收到心跳时间
-	nextIndex        []int                 // 对于每个服务器，下一条要发送的日志条目的绝对索引
-	matchIndex       []int                 // 对于每个服务器，已知的最高日志条目绝对索引
-	applyCh          chan raftapi.ApplyMsg // 提交日志的通道
-	lastIncludeIndex int                   // 快照包含的最后日志的绝对索引
-	lastIncludeTerm  int                   // 快照包含的最后日志的任期
+	mu                sync.Mutex            // mutex锁
+	peers             []*labrpc.ClientEnd   // 所有对等节点的RPC端点
+	persister         *tester.Persister     // 持久化状态的对象
+	me                int                   // 本节点的在peers里的索引
+	dead              int32                 // 该节点是否已被杀死
+	currentTerm       int                   // 当前任期(Persistent)
+	votedFor          int                   // 投票给谁(Persistent)
+	log               []LogEntry            // 日志条目(Persistent)
+	commitIndex       int                   // 已提交的最高日志条目绝对索引
+	lastApplied       int                   // 已应用到状态机的最高日志条目绝对索引
+	state             int                   // 节点状态：候选者、领导者、跟随者
+	lastHeart         time.Time             // 最后收到心跳时间
+	nextIndex         []int                 // 对于每个服务器，下一条要发送的日志条目的绝对索引
+	matchIndex        []int                 // 对于每个服务器，已知的最高日志条目绝对索引
+	applyCh           chan raftapi.ApplyMsg // 提交日志的通道
+	lastIncludedIndex int                   // 快照包含的最后日志的绝对索引
+	lastIncludedTerm  int                   // 快照包含的最后日志的任期
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -73,8 +72,8 @@ func (rf *Raft) getRaftStateBytes() []byte {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	e.Encode(rf.lastIncludeIndex)
-	e.Encode(rf.lastIncludeTerm)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	return w.Bytes()
 }
 
@@ -95,19 +94,19 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []LogEntry
-	var lastIncludeIndex int
-	var lastIncludeTerm int
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&log) != nil ||
-		d.Decode(&lastIncludeIndex) != nil ||
-		d.Decode(&lastIncludeTerm) != nil {
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil {
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
-		rf.lastIncludeIndex = lastIncludeIndex
-		rf.lastIncludeTerm = lastIncludeTerm
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 	}
 }
 
@@ -132,12 +131,12 @@ type InstallSnapshotReply struct {
 
 // 将相对索引转换为绝对索引
 func (rf *Raft) getAbsPos(relIndex int) int {
-	return relIndex + rf.lastIncludeIndex
+	return relIndex + rf.lastIncludedIndex
 }
 
 // 将绝对索引转换为相对索引
 func (rf *Raft) getRelPos(absIndex int) int {
-	return absIndex - rf.lastIncludeIndex
+	return absIndex - rf.lastIncludedIndex
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
@@ -146,6 +145,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.currentTerm
 	// 检查任期
 	if args.Term < rf.currentTerm {
+		rf.mu.Unlock()
 		return
 	}
 	toPersist := false
@@ -163,14 +163,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if toPersist {
 		rf.persist()
 	}
-	if args.LastIncludedIndex <= rf.lastIncludeIndex {
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
 		// 本地快照更新更快，忽略
+		rf.mu.Unlock()
 		return
 	}
 
 	// 修剪日志
 	newLog := make([]LogEntry, 1)
-	newLog[0] = LogEntry{Term: rf.lastIncludeTerm}
+	newLog[0] = LogEntry{Term: args.LastIncludedTerm}
 
 	// 查找新快照的最后一个索引在当前日志的相对位置
 	relPos := rf.getRelPos(args.LastIncludedIndex)
@@ -183,8 +184,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.log = newLog
 
 	// 更新快照元信息
-	rf.lastIncludeIndex = args.LastIncludedIndex
-	rf.lastIncludeTerm = args.LastIncludedTerm
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
 
 	// 写入新的快照并持久化
 	rf.persister.Save(rf.getRaftStateBytes(), args.Data)
@@ -212,8 +213,8 @@ func (rf *Raft) sendInstallSnapshot(server int) {
 	args := &InstallSnapshotArgs{
 		Term:              rf.currentTerm,
 		LeaderId:          rf.me,
-		LastIncludedIndex: rf.lastIncludeIndex,
-		LastIncludedTerm:  rf.lastIncludeTerm,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.lastIncludedTerm,
 		Data:              rf.persister.ReadSnapshot(),
 	}
 	reply := &InstallSnapshotReply{}
@@ -237,8 +238,8 @@ func (rf *Raft) sendInstallSnapshot(server int) {
 		return
 	}
 	// 更新 nextIndex 和 matchIndex
-	rf.nextIndex[server] = max(rf.lastIncludeIndex+1, rf.nextIndex[server])
-	rf.matchIndex[server] = max(rf.lastIncludeIndex, rf.matchIndex[server])
+	rf.nextIndex[server] = max(rf.lastIncludedIndex+1, rf.nextIndex[server])
+	rf.matchIndex[server] = max(rf.lastIncludedIndex, rf.matchIndex[server])
 }
 
 // 服务表示它已经创建了包含直到并包括 index 的快照，这意味着服务
@@ -247,16 +248,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if index <= rf.lastIncludeIndex || index > rf.getAbsPos(len(rf.log)-1) {
+	if index <= rf.lastIncludedIndex || index > rf.getAbsPos(len(rf.log)-1) {
 		// 本地日志已被快照覆盖，或索引越界
 		return
 	}
 	logPos := rf.getRelPos(index)
-	rf.lastIncludeIndex = index
-	rf.lastIncludeTerm = rf.log[logPos].Term
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = rf.log[logPos].Term
 	// 修剪日志
 	newLog := make([]LogEntry, 1)
-	newLog[0] = LogEntry{Term: rf.lastIncludeTerm}
+	newLog[0] = LogEntry{Term: rf.lastIncludedTerm}
 	// 如果快照并未包含所有日志，保留快照之后的日志
 	if index < rf.getAbsPos(len(rf.log)-1) {
 		newLog = append(newLog, rf.log[logPos+1:]...)
@@ -382,6 +383,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ConflictTerm = -1
 		return
 	}
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		// Follower 日志被快照覆盖，无法匹配
+		reply.Success = false
+		reply.ConflictIndex = rf.lastIncludedIndex + 1
+		reply.ConflictTerm = -1
+		return
+	}
 	if rf.log[rf.getRelPos(args.PrevLogIndex)].Term != args.PrevLogTerm {
 		// 任期不匹配，找到冲突任期在本地首次出现的位置
 		reply.Success = false
@@ -415,6 +423,12 @@ func (rf *Raft) sendAppendEntries(server int, stay_leader *int32) {
 		rf.mu.Unlock()
 		return
 	}
+	if rf.nextIndex[server] <= rf.lastIncludedIndex {
+		// 需要发送快照
+		rf.mu.Unlock()
+		go rf.sendInstallSnapshot(server)
+		return
+	}
 	args := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
@@ -423,12 +437,6 @@ func (rf *Raft) sendAppendEntries(server int, stay_leader *int32) {
 	args.PrevLogIndex = rf.nextIndex[server] - 1
 	args.PrevLogTerm = rf.log[rf.getRelPos(args.PrevLogIndex)].Term
 	nextIndex := min(rf.nextIndex[server], rf.getAbsPos(len(rf.log)))
-	if nextIndex <= rf.lastIncludeIndex {
-		// 需要发送快照
-		rf.mu.Unlock()
-		go rf.sendInstallSnapshot(server)
-		return
-	}
 	entries := append([]LogEntry{}, rf.log[rf.getRelPos(nextIndex):]...)
 	rf.mu.Unlock()
 	args.Entries = entries
@@ -451,8 +459,14 @@ func (rf *Raft) sendAppendEntries(server int, stay_leader *int32) {
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 		// 立即推进commitIndex
-		for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
-			if rf.log[N].Term != rf.currentTerm {
+		lastIndex := rf.getAbsPos(len(rf.log) - 1)
+		for N := lastIndex; N > rf.commitIndex; N-- {
+			if N <= rf.lastIncludedIndex {
+				// 快照已经提交
+				break
+			}
+			rel := rf.getRelPos(N)
+			if rf.log[rel].Term != rf.currentTerm {
 				continue
 			} // 只考虑本任期内的
 			count := 1
@@ -460,12 +474,13 @@ func (rf *Raft) sendAppendEntries(server int, stay_leader *int32) {
 				if i == rf.me {
 					continue
 				}
-				if rf.matchIndex[i] >= rf.getAbsPos(N) {
+				if rf.matchIndex[i] >= N {
 					count++
 				}
 			}
-			if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
-				rf.commitIndex = rf.getAbsPos(N)
+			if count > len(rf.peers)/2 {
+				// log.Printf("term %d: leader %d commitIndex advance to %d", rf.currentTerm, rf.me, N)
+				rf.commitIndex = N
 				break // 过半即可
 			}
 		}
@@ -503,7 +518,7 @@ func (rf *Raft) sendAppendEntries(server int, stay_leader *int32) {
 		rf.nextIndex[server] = reply.ConflictIndex
 	}
 	// 已经退到不能用日志追加的地步了
-	if rf.nextIndex[server] < rf.lastIncludeIndex {
+	if rf.nextIndex[server] <= rf.lastIncludedIndex {
 		go rf.sendInstallSnapshot(server)
 		return
 	}
@@ -588,6 +603,7 @@ func (rf *Raft) startElection() bool {
 			votes++
 			if votes > n/2 {
 				// 取得多数票，成为 leader
+				// log.Printf("term %d: server %d becomes leader, lastLogIndex=%d lastLogTerm=%d", term, rf.me, rf.getAbsPos(len(rf.log)-1), rf.log[len(rf.log)-1].Term)
 				rf.initLeaderState()
 				return true
 			}
@@ -624,6 +640,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) applier() {
 	for !rf.killed() {
 		rf.mu.Lock()
+
+		if rf.lastApplied < rf.lastIncludedIndex {
+			// 快照未应用
+			rf.lastApplied = rf.lastIncludedIndex
+			msg := raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.persister.ReadSnapshot(),
+				SnapshotTerm:  rf.lastIncludedTerm,
+				SnapshotIndex: rf.lastIncludedIndex,
+			}
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			continue
+		}
 
 		if rf.commitIndex > rf.lastApplied {
 			// 有可用日志
@@ -709,8 +739,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.state = Follower
-	rf.lastIncludeIndex = 0
-	rf.lastIncludeTerm = 0
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	rf.applyCh = applyCh
