@@ -2,31 +2,37 @@ package rsm
 
 import (
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
-	"6.5840/raft1"
+	raft "6.5840/raft1"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 
+	"sync/atomic"
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
 
+var idCounter int64 = 0
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	// Field names must start with capital letters
+	Me  int   // 客户端id
+	Id  int64 // 操作唯一标识符
+	Req any   // 客户端请求
 }
 
+type applyResult struct {
+	Oper Op  // 应用的操作
+	Ret  any // 操作结果
+}
 
-// A server (i.e., ../server.go) that wants to replicate itself calls
-// MakeRSM and must implement the StateMachine interface.  This
-// interface allows the rsm package to interact with the server for
-// server-specific operations: the server must implement DoOp to
-// execute an operation (e.g., a Get or Put request), and
-// Snapshot/Restore to snapshot and restore the server's state.
+// 想要进行自我复制的服务器（例如 ../server.go）会调用 MakeRSM，并且必须实现
+// StateMachine 接口。该接口允许 rsm 包与服务器交互，执行服务器特定的操作：
+// 服务器必须实现 DoOp 接口来执行操作（例如，Get 或 Put 请求），并实现
+// Snapshot/Restore 接口来对服务器状态进行快照和恢复。
 type StateMachine interface {
 	DoOp(any) any
 	Snapshot() []byte
@@ -40,34 +46,30 @@ type RSM struct {
 	applyCh      chan raftapi.ApplyMsg
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
-	// Your definitions here.
+	waitCh       map[int]chan applyResult
+	dead         int32
 }
 
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant key/value service.
-//
-// me is the index of the current server in servers[].
-//
-// the k/v server should store snapshots through the underlying Raft
-// implementation, which should call persister.SaveStateAndSnapshot() to
-// atomically save the Raft state along with the snapshot.
-// The RSM should snapshot when Raft's saved state exceeds maxraftstate bytes,
-// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
-// you don't need to snapshot.
-//
-// MakeRSM() must return quickly, so it should start goroutines for
-// any long-running work.
+// servers[] 包含将通过 Raft 协作以构成容错键值服务的服务器集合的端口。
+// me 是 servers[] 中当前服务器的索引。
+// 键值服务器应通过底层 Raft 实现存储快照，底层 Raft 实现应调用
+// persister.SaveStateAndSnapshot() 来原子地保存 Raft 状态以及快照。
+// 当 Raft 保存的状态超过 maxraftstate 字节数时，RSM 应进行快照，
+// 以便 Raft 可以对其日志进行垃圾回收。如果 maxraftstate 为 -1，则无需进行快照。
+// MakerRSM() 必须快速返回，因此它应启动 goroutine 来处理任何长时间运行的任务。
 func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, maxraftstate int, sm StateMachine) *RSM {
 	rsm := &RSM{
 		me:           me,
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		waitCh:       make(map[int]chan applyResult),
+		dead:         0,
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	go rsm.applyLoop()
 	return rsm
 }
 
@@ -75,16 +77,74 @@ func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
 
+func (rsm *RSM) ApplyCh() chan raftapi.ApplyMsg {
+	return rsm.applyCh
+}
 
-// Submit a command to Raft, and wait for it to be committed.  It
-// should return ErrWrongLeader if client should find new leader and
-// try again.
+func (rsm *RSM) applyLoop() {
+	for msg := range rsm.applyCh {
+		if msg.CommandValid {
+			// raft以普通command的形式提交了一个操作
+			oper := msg.Command.(Op)
+			// 在状态机执行操作
+			ret := rsm.sm.DoOp(oper.Req)
+
+			// 唤醒等待这个index的Submit
+			rsm.mu.Lock()
+			if ch, ok := rsm.waitCh[msg.CommandIndex]; ok {
+				// select {
+				// case ch <- applyResult{Oper: oper, Ret: ret}:
+				// default:
+				// }
+				ch <- applyResult{Oper: oper, Ret: ret}
+				close(ch)
+				delete(rsm.waitCh, msg.CommandIndex)
+			}
+			rsm.mu.Unlock()
+		} else if msg.SnapshotValid {
+			// raft以快照的形式提交了一个/一堆操作
+			rsm.sm.Restore(msg.Snapshot)
+		}
+	}
+}
+
+// 向 Raft 提交命令，并等待其被提交。
+// 如果客户端找到了新的领导者，则应返回 ErrWrongLeader，并重试。
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 
-	// Submit creates an Op structure to run a command through Raft;
-	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
+	// Submit creates an Oper structure to run a command through Raft;
+	// for example: op := Oper{Me: rsm.me, Id: id, Req: req}, where req
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	id := atomic.AddInt64(&idCounter, 1)
+	oper := Op{Me: rsm.me, Id: id, Req: req}
+	index, term, isLeader := rsm.rf.Start(oper)
+	if !isLeader {
+		return rpc.ErrWrongLeader, nil
+	}
+
+	ch := make(chan applyResult, 1)
+	rsm.mu.Lock()
+	rsm.waitCh[index] = ch
+	rsm.mu.Unlock()
+
+	select {
+	case res := <-ch:
+		rsm.mu.Lock()
+		delete(rsm.waitCh, index)
+		rsm.mu.Unlock()
+		currentTerm, isLeader := rsm.rf.GetState()
+		if !isLeader || term != currentTerm || res.Oper.Id != id || res.Oper.Me != rsm.me {
+			// 领导者变更了
+			return rpc.ErrWrongLeader, nil
+		}
+		return rpc.OK, res.Ret
+	case <-time.After(1200 * time.Millisecond):
+		// 超时
+		rsm.mu.Lock()
+		delete(rsm.waitCh, index)
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil
+	}
 }
