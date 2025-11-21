@@ -17,11 +17,19 @@ var useRaftStateMachine bool // to plug in another raft besided raft1
 
 var idCounter int64 = 0
 
+func genId() int64 {
+	return atomic.AddInt64(&idCounter, 1)
+}
+
 type Op struct {
 	// Field names must start with capital letters
 	Me  int   // 客户端id
 	Id  int64 // 操作唯一标识符
 	Req any   // 客户端请求
+}
+
+func (a *Op) equals(b *Op) bool {
+	return a.Me == b.Me && a.Id == b.Id
 }
 
 type applyResult struct {
@@ -40,14 +48,17 @@ type StateMachine interface {
 }
 
 type RSM struct {
-	mu           sync.Mutex
-	me           int
-	rf           raftapi.Raft
-	applyCh      chan raftapi.ApplyMsg
-	maxraftstate int // snapshot if log grows this big
-	sm           StateMachine
-	waitCh       map[int]chan applyResult
-	dead         int32
+	mu               sync.Mutex
+	me               int
+	rf               raftapi.Raft
+	applyCh          chan raftapi.ApplyMsg
+	maxraftstate     int // snapshot if log grows this big
+	servers          []*labrpc.ClientEnd
+	sm               StateMachine
+	persister        *tester.Persister
+	waitCh           map[int]chan applyResult
+	appliedResult    map[int]applyResult
+	lastAppliedIndex int
 }
 
 // servers[] 包含将通过 Raft 协作以构成容错键值服务的服务器集合的端口。
@@ -59,12 +70,14 @@ type RSM struct {
 // MakerRSM() 必须快速返回，因此它应启动 goroutine 来处理任何长时间运行的任务。
 func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, maxraftstate int, sm StateMachine) *RSM {
 	rsm := &RSM{
-		me:           me,
-		maxraftstate: maxraftstate,
-		applyCh:      make(chan raftapi.ApplyMsg),
-		sm:           sm,
-		waitCh:       make(map[int]chan applyResult),
-		dead:         0,
+		me:            me,
+		maxraftstate:  maxraftstate,
+		servers:       servers,
+		applyCh:       make(chan raftapi.ApplyMsg),
+		sm:            sm,
+		persister:     persister,
+		waitCh:        make(map[int]chan applyResult),
+		appliedResult: make(map[int]applyResult),
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
@@ -84,26 +97,48 @@ func (rsm *RSM) ApplyCh() chan raftapi.ApplyMsg {
 func (rsm *RSM) applyLoop() {
 	for msg := range rsm.applyCh {
 		if msg.CommandValid {
-			// raft以普通command的形式提交了一个操作
-			oper := msg.Command.(Op)
-			// 在状态机执行操作
-			ret := rsm.sm.DoOp(oper.Req)
-
-			// 唤醒等待这个index的Submit
 			rsm.mu.Lock()
+
+			if msg.CommandIndex <= rsm.lastAppliedIndex {
+				rsm.mu.Unlock()
+				continue
+			}
+			oper := msg.Command.(Op)
+			// 第一次在状态机执行操作
+			ret := rsm.sm.DoOp(oper.Req)
+			// 缓存结果
+			rsm.appliedResult[msg.CommandIndex] = applyResult{Oper: oper, Ret: ret}
+			// 唤醒等待这个index的Submit
 			if ch, ok := rsm.waitCh[msg.CommandIndex]; ok {
-				// select {
-				// case ch <- applyResult{Oper: oper, Ret: ret}:
-				// default:
-				// }
-				ch <- applyResult{Oper: oper, Ret: ret}
-				close(ch)
+				select {
+				case ch <- applyResult{Oper: oper, Ret: ret}:
+				default:
+				}
 				delete(rsm.waitCh, msg.CommandIndex)
+			}
+			rsm.lastAppliedIndex = msg.CommandIndex
+			if rsm.maxraftstate != -1 && rsm.persister.RaftStateSize() > rsm.maxraftstate {
+				// 进行快照
+				snapshot := rsm.sm.Snapshot()
+				rsm.rf.Snapshot(msg.CommandIndex, snapshot)
+				for idx := range rsm.appliedResult {
+					if idx <= msg.CommandIndex {
+						delete(rsm.appliedResult, idx)
+					}
+				}
 			}
 			rsm.mu.Unlock()
 		} else if msg.SnapshotValid {
-			// raft以快照的形式提交了一个/一堆操作
+			rsm.mu.Lock()
 			rsm.sm.Restore(msg.Snapshot)
+			rsm.lastAppliedIndex = msg.SnapshotIndex
+			rsm.appliedResult = make(map[int]applyResult)
+			for idx := range rsm.appliedResult {
+				if idx <= msg.SnapshotIndex {
+					delete(rsm.appliedResult, idx)
+				}
+			}
+			rsm.mu.Unlock()
 		}
 	}
 }
@@ -111,13 +146,7 @@ func (rsm *RSM) applyLoop() {
 // 向 Raft 提交命令，并等待其被提交。
 // 如果客户端找到了新的领导者，则应返回 ErrWrongLeader，并重试。
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
-
-	// Submit creates an Oper structure to run a command through Raft;
-	// for example: op := Oper{Me: rsm.me, Id: id, Req: req}, where req
-	// is the argument to Submit and id is a unique id for the op.
-
-	// your code here
-	id := atomic.AddInt64(&idCounter, 1)
+	id := genId()
 	oper := Op{Me: rsm.me, Id: id, Req: req}
 	index, term, isLeader := rsm.rf.Start(oper)
 	if !isLeader {
@@ -126,25 +155,45 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 
 	ch := make(chan applyResult, 1)
 	rsm.mu.Lock()
+
+	if res, ok := rsm.appliedResult[index]; ok {
+		if res.Oper.equals(&oper) {
+			rsm.mu.Unlock()
+			return rpc.OK, res.Ret
+		}
+	}
 	rsm.waitCh[index] = ch
 	rsm.mu.Unlock()
 
-	select {
-	case res := <-ch:
-		rsm.mu.Lock()
-		delete(rsm.waitCh, index)
-		rsm.mu.Unlock()
-		currentTerm, isLeader := rsm.rf.GetState()
-		if !isLeader || term != currentTerm || res.Oper.Id != id || res.Oper.Me != rsm.me {
-			// 领导者变更了
+	timeout := time.After(2 * time.Second)
+	leaderticker := time.NewTicker(50 * time.Millisecond)
+
+	for {
+		select {
+		case res := <-ch:
+			rsm.mu.Lock()
+			delete(rsm.waitCh, index)
+			rsm.mu.Unlock()
+			currentTerm, isLeader := rsm.rf.GetState()
+			if !isLeader || term != currentTerm || res.Oper.Id != id || res.Oper.Me != rsm.me {
+				// 领导者变更了
+				return rpc.ErrWrongLeader, nil
+			}
+			return rpc.OK, res.Ret
+		case <-leaderticker.C:
+			// 定期检查是否还是领导者
+			if _, isLeader := rsm.rf.GetState(); !isLeader {
+				rsm.mu.Lock()
+				delete(rsm.waitCh, index)
+				rsm.mu.Unlock()
+				return rpc.ErrWrongLeader, nil
+			}
+		case <-timeout:
+			// 超时
+			rsm.mu.Lock()
+			delete(rsm.waitCh, index)
+			rsm.mu.Unlock()
 			return rpc.ErrWrongLeader, nil
 		}
-		return rpc.OK, res.Ret
-	case <-time.After(1200 * time.Millisecond):
-		// 超时
-		rsm.mu.Lock()
-		delete(rsm.waitCh, index)
-		rsm.mu.Unlock()
-		return rpc.ErrWrongLeader, nil
 	}
 }

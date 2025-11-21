@@ -64,10 +64,6 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
 	args := rpc.PutArgs{Key: key, Value: value, Version: version}
 	reply := rpc.PutReply{}
-	// ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
-	// if ok {
-	// 	return reply.Err
-	// }
 	ok := false
 	retry := false
 	for !ok {
