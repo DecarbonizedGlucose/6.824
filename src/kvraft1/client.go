@@ -38,16 +38,17 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 		ok := ck.clnt.Call(ck.servers[index], "KVServer.Get", &args, &reply)
 		if ok {
 			ck.lastLeader = index
-			if reply.Err == rpc.OK || reply.Err == rpc.ErrNoKey {
+			switch reply.Err {
+			case rpc.OK:
 				return reply.Value, reply.Version, reply.Err
-			}
-			if reply.Err == rpc.ErrWrongLeader {
-				index = (index + 1) % len(ck.servers)
-				continue
+			case rpc.ErrNoKey:
+				return "", 0, reply.Err
+			default: // rpc.ErrWrongLeader
 			}
 		}
+		// RPC调用失败或者返回了 ErrWrongLeader
 		index = (index + 1) % len(ck.servers)
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -76,22 +77,21 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		reply := rpc.PutReply{}
 		ok := ck.clnt.Call(ck.servers[index], "KVServer.Put", &args, &reply)
 		if ok {
-			ck.lastLeader = index
 			switch reply.Err {
+			case rpc.OK, rpc.ErrNoKey:
+				ck.lastLeader = index
+				return reply.Err
 			case rpc.ErrVersion:
+				ck.lastLeader = index
 				if !retry {
 					return rpc.ErrVersion
 				}
 				return rpc.ErrMaybe
-			case rpc.ErrWrongLeader:
-				index = (index + 1) % len(ck.servers)
-				continue
-			default:
-				return reply.Err
+			default: // rpc.ErrWrongLeader
 			}
 		}
 		retry = true
 		index = (index + 1) % len(ck.servers)
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 }

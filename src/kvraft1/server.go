@@ -22,8 +22,19 @@ type KVServer struct {
 	rsm  *rsm.RSM
 
 	// Your definitions here.
-	mu   sync.Mutex
-	data map[string]kvEntry
+	mu    sync.Mutex
+	data  map[string]kvEntry
+	locks map[string]*sync.RWMutex
+}
+
+// 获取特定键的锁，如果不存在则创建
+func (kv *KVServer) getLock(key string) *sync.RWMutex {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if _, exists := kv.locks[key]; !exists {
+		kv.locks[key] = &sync.RWMutex{}
+	}
+	return kv.locks[key]
 }
 
 // To type-cast req to the right type, take a look at Go's type switches or type
@@ -32,36 +43,58 @@ type KVServer struct {
 // https://go.dev/tour/methods/16
 // https://go.dev/tour/methods/15
 func (kv *KVServer) DoOp(req any) any {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	switch t := req.(type) {
 	case *rpc.GetArgs:
-		if ent, ok := kv.data[t.Key]; ok {
-			return rpc.GetReply{
-				Value:   ent.Value,
-				Version: ent.Version,
-				Err:     rpc.OK,
-			}
-		}
-		return rpc.GetReply{Err: rpc.ErrNoKey}
+		return kv.doGet(t)
+	case rpc.GetArgs:
+		return kv.doGet(&t)
 	case *rpc.PutArgs:
-		if env, ok := kv.data[t.Key]; ok {
-			if env.Version == t.Version {
-				env.Value = t.Value
-				env.Version++
-				kv.data[t.Key] = env
-				return rpc.PutReply{Err: rpc.OK}
-			}
-			return rpc.PutReply{Err: rpc.ErrVersion}
+		return kv.doPut(t)
+	case rpc.PutArgs:
+		return kv.doPut(&t)
+	default:
+		panic("未知的类型")
+	}
+}
+
+func (kv *KVServer) doGet(args *rpc.GetArgs) rpc.GetReply {
+	if kv.killed() {
+		return rpc.GetReply{Err: rpc.ErrWrongLeader}
+	}
+	lock := kv.getLock(args.Key)
+	lock.RLock()
+	defer lock.RUnlock()
+	if ent, ok := kv.data[args.Key]; ok {
+		return rpc.GetReply{
+			Value:   ent.Value,
+			Version: ent.Version,
+			Err:     rpc.OK,
 		}
-		if t.Version == 0 {
-			kv.data[t.Key] = kvEntry{Value: t.Value, Version: 1}
+	}
+	return rpc.GetReply{Err: rpc.ErrNoKey}
+}
+
+func (kv *KVServer) doPut(args *rpc.PutArgs) rpc.PutReply {
+	if kv.killed() {
+		return rpc.PutReply{Err: rpc.ErrWrongLeader}
+	}
+	lock := kv.getLock(args.Key)
+	lock.Lock()
+	defer lock.Unlock()
+	if env, ok := kv.data[args.Key]; ok {
+		if env.Version == args.Version {
+			env.Value = args.Value
+			env.Version++
+			kv.data[args.Key] = env
 			return rpc.PutReply{Err: rpc.OK}
 		}
-		return rpc.PutReply{Err: rpc.ErrNoKey}
-	default:
-		return nil
+		return rpc.PutReply{Err: rpc.ErrVersion}
 	}
+	if args.Version == 0 {
+		kv.data[args.Key] = kvEntry{Value: args.Value, Version: 1}
+		return rpc.PutReply{Err: rpc.OK}
+	}
+	return rpc.PutReply{Err: rpc.ErrNoKey}
 }
 
 func (kv *KVServer) Snapshot() []byte {
@@ -77,6 +110,10 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 	// Your code here. Use kv.rsm.Submit() to submit args
 	// You can use go's type casts to turn the any return value
 	// of Submit() into a GetReply: rep.(rpc.GetReply)
+	if kv.killed() {
+		reply.Err = rpc.ErrWrongLeader
+		return
+	}
 	err, ret := kv.rsm.Submit(args)
 	if err != rpc.OK {
 		reply.Err = err
@@ -92,6 +129,10 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	// Your code here. Use kv.rsm.Submit() to submit args
 	// You can use go's type casts to turn the any return value
 	// of Submit() into a PutReply: rep.(rpc.PutReply)
+	if kv.killed() {
+		reply.Err = rpc.ErrWrongLeader
+		return
+	}
 	err, ret := kv.rsm.Submit(args)
 	if err != rpc.OK {
 		reply.Err = err
@@ -127,8 +168,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(rsm.Op{})
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
+	labgob.Register(kvEntry{})
 
-	kv := &KVServer{me: me, data: make(map[string]kvEntry)}
+	kv := &KVServer{
+		me:    me,
+		mu:    sync.Mutex{},
+		data:  make(map[string]kvEntry),
+		locks: make(map[string]*sync.RWMutex),
+	}
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.
