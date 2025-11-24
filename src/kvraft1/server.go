@@ -4,6 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"bytes"
+
 	"6.5840/kvraft1/rsm"
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
@@ -22,19 +24,8 @@ type KVServer struct {
 	rsm  *rsm.RSM
 
 	// Your definitions here.
-	mu    sync.Mutex
-	data  map[string]kvEntry
-	locks map[string]*sync.RWMutex
-}
-
-// 获取特定键的锁，如果不存在则创建
-func (kv *KVServer) getLock(key string) *sync.RWMutex {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	if _, exists := kv.locks[key]; !exists {
-		kv.locks[key] = &sync.RWMutex{}
-	}
-	return kv.locks[key]
+	mu   sync.Mutex
+	data map[string]kvEntry
 }
 
 // To type-cast req to the right type, take a look at Go's type switches or type
@@ -43,6 +34,8 @@ func (kv *KVServer) getLock(key string) *sync.RWMutex {
 // https://go.dev/tour/methods/16
 // https://go.dev/tour/methods/15
 func (kv *KVServer) DoOp(req any) any {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	switch t := req.(type) {
 	case *rpc.GetArgs:
 		return kv.doGet(t)
@@ -61,9 +54,6 @@ func (kv *KVServer) doGet(args *rpc.GetArgs) rpc.GetReply {
 	if kv.killed() {
 		return rpc.GetReply{Err: rpc.ErrWrongLeader}
 	}
-	lock := kv.getLock(args.Key)
-	lock.RLock()
-	defer lock.RUnlock()
 	if ent, ok := kv.data[args.Key]; ok {
 		return rpc.GetReply{
 			Value:   ent.Value,
@@ -78,9 +68,6 @@ func (kv *KVServer) doPut(args *rpc.PutArgs) rpc.PutReply {
 	if kv.killed() {
 		return rpc.PutReply{Err: rpc.ErrWrongLeader}
 	}
-	lock := kv.getLock(args.Key)
-	lock.Lock()
-	defer lock.Unlock()
 	if env, ok := kv.data[args.Key]; ok {
 		if env.Version == args.Version {
 			env.Value = args.Value
@@ -99,11 +86,44 @@ func (kv *KVServer) doPut(args *rpc.PutArgs) rpc.PutReply {
 
 func (kv *KVServer) Snapshot() []byte {
 	// Your code here
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if kv.killed() {
+		return nil
+	}
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(kv.data) != nil {
+		panic("Failed to encode KVServer snapshot")
+	}
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
 	// Your code here
+	if kv.killed() {
+		return
+	}
+	if kv.data == nil {
+		kv.data = make(map[string]kvEntry)
+	}
+	if len(data) == 0 {
+		kv.data = make(map[string]kvEntry)
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var kvData map[string]kvEntry
+	if d.Decode(&kvData) != nil {
+		panic("Failed to decode KVServer snapshot")
+	}
+
+	kv.mu.Lock()
+	kv.data = kvData
+	kv.mu.Unlock()
+
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -171,10 +191,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(kvEntry{})
 
 	kv := &KVServer{
-		me:    me,
-		mu:    sync.Mutex{},
-		data:  make(map[string]kvEntry),
-		locks: make(map[string]*sync.RWMutex),
+		me:   me,
+		mu:   sync.Mutex{},
+		data: make(map[string]kvEntry),
 	}
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
