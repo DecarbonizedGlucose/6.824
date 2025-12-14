@@ -61,10 +61,6 @@ type Raft struct {
 
 /* ==================== utils ==================== */
 
-func (rf *Raft) getAbsPos(relPos int) int {
-	return relPos + rf.lastIncludedIndex
-}
-
 func (rf *Raft) getRelPos(absPos int) int {
 	return absPos - rf.lastIncludedIndex
 }
